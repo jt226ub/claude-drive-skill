@@ -22,8 +22,8 @@ cd claude-drive-skill
 Restart Claude Code, then run `/drive-on` to switch on the standing mode.
 Install alone does not enable it — it only puts the parts in place.
 
-Requires `jq` (`brew install jq` / `apt install jq`), which the hook uses to
-build its JSON output.
+Needs `bash` and `awk`, and nothing else on a machine with no `settings.json`
+yet. See [No jq](#no-jq) for the one case that wants more.
 
 To let a Claude Code session do it for you, point it at the repo:
 
@@ -46,15 +46,49 @@ content; the rest are plumbing.
 overwrites, and skips the edit entirely if the hook is already registered, so
 re-running is safe and other hooks survive.
 
+## No jq
+
+The hook writes the contract to plain stdout, which `UserPromptSubmit` adds to
+the turn's context. It previously built a JSON `additionalContext` envelope
+with `jq` — which is absent on most Windows machines, and since the broken
+pipeline still let the script `exit 0`, drive mode just quietly never engaged.
+A dependency whose absence is silent is worse than one that fails loudly, so it
+went.
+
+Editing an existing `settings.json` is the one job that still wants a real JSON
+parser, and `install.sh` handles it in tiers:
+
+| Situation | What happens |
+| --- | --- |
+| No `settings.json`, or an empty one | The file is written whole. No parser needed. |
+| Hook already registered | Left alone. |
+| Existing content, `node` or `perl` runs | Merged with it, backup written first. |
+| Existing content, neither runs | File untouched; the snippet is printed to paste. |
+
+`node` is preferred because it preserves key order; `perl` is the fallback
+because `JSON::PP` has been core since 5.14, which covers macOS, essentially
+every Linux, and Git for Windows — at the cost of alphabetising the keys it
+writes back. `python` is deliberately not used: Windows ships
+`python`/`python3` App Execution Alias shims that satisfy `command -v` and then
+exit 49 without running anything, so detection here probes by *executing* the
+interpreter rather than by finding it on `PATH`.
+
+`uninstall.sh` deregisters the hook the same way, and when no runtime is
+available it says so and leaves the entry in place — harmless, since it points
+at a script that has just been deleted.
+
 ## Editing the contract
 
 Edit `skills/drive/SKILL.md` and nothing else. The hook strips the YAML
 frontmatter and injects the body verbatim, so the `/drive` skill and the
 standing mode can never drift apart.
 
-**Size limit:** the harness caps injected `additionalContext` at 10,000
-characters. `install.sh` refuses to install a body over 9,000 and tells you to
-trim; without that guard the contract would be silently truncated mid-sentence.
+**Size budget:** `install.sh` refuses to install a contract body over 9,000
+characters and tells you to trim. In standing mode the whole body is injected
+into *every* prompt, so its length is a cost paid on each turn. The 9,000 is a
+self-imposed budget — it was originally the guard against a 10,000-character
+`additionalContext` cap, which the stdout path no longer goes through, but the
+context cost was always the better reason to keep the contract tight.
 
 ## Removing it
 
