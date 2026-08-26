@@ -5,12 +5,16 @@
 #   OMNIROUTE_BASE_URL=http://host:20128 ./omniroute/install-omniroute.sh
 #   OMNIROUTE_CLI=/path/to/OmniRoute/bin/omniroute.mjs ./omniroute/install-omniroute.sh
 #
-# Unlike install.sh (which targets a Claude Code hook), this applies the contract
-# server-side, so EVERY client and model routed through the gateway receives it and
+# Unlike install.sh, which targets a Claude Code hook, this applies the contract
+# server-side: every client and model routed through the gateway receives it and
 # no client can opt out. skills/drive/SKILL.md stays the single source of truth —
 # this script never edits the contract, it only ships it.
 #
 # Idempotent: re-running overwrites the stored prompt with the current SKILL.md.
+#
+# The only thing this needs beyond bash is the omniroute CLI itself. It used to
+# shell out to python3 to build and read back the JSON; that is now pure bash in
+# lib.sh, so nothing is required here that the gateway did not already require.
 
 set -euo pipefail
 
@@ -18,9 +22,12 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILL="$SRC/skills/drive/SKILL.md"
 BASE="${OMNIROUTE_BASE_URL:-http://127.0.0.1:20128}"
 
+# shellcheck source=../lib.sh
+. "$SRC/lib.sh"
+
 [ -f "$SKILL" ] || { echo "ERROR: missing $SKILL" >&2; exit 1; }
 
-# Resolve the OmniRoute CLI: explicit override, then PATH, then a sibling checkout.
+# Resolve the OmniRoute CLI: explicit override, then PATH, then give up.
 if [ -n "${OMNIROUTE_CLI:-}" ]; then
   CLI=(node "$OMNIROUTE_CLI")
 elif command -v omniroute >/dev/null 2>&1; then
@@ -31,55 +38,65 @@ else
   exit 1
 fi
 
-command -v python3 >/dev/null || { echo "ERROR: python3 is required." >&2; exit 1; }
+# Strip the frontmatter with the same rule hooks/drive-mode.sh uses, so both
+# deployment paths ship byte-identical text.
+BODY="$(strip_frontmatter "$SKILL")"
+BODY=${BODY#"${BODY%%[![:space:]]*}"}          # drop the leading blank line
 
-# Strip YAML frontmatter with the same rule the Claude Code hook uses, so both
-# deployment paths inject byte-identical text.
-BODY="$(awk 'f >= 2 { print } /^---[[:space:]]*$/ { f++ }' "$SKILL")"
-CHARS=${#BODY}
-# OmniRoute caps prefixPrompt at 50,000; the 9,000 guard from install.sh is kept so
-# one SKILL.md stays deployable to BOTH targets without divergence.
-if [ "$CHARS" -gt 9000 ]; then
-  echo "ERROR: contract body is $CHARS chars (>9000)." >&2
-  echo "       It would still fit OmniRoute, but would break the Claude Code hook." >&2
-  echo "       Keep one contract that fits both — trim SKILL.md." >&2
+# OmniRoute caps prefixPrompt at 50,000; install.sh's 9,000 budget is kept here
+# so one SKILL.md stays deployable to BOTH targets without divergence.
+if [ "${#BODY}" -gt 9000 ]; then
+  echo "ERROR: contract body is ${#BODY} chars (>9000)." >&2
+  echo "       It would still fit OmniRoute, but it is over the budget that" >&2
+  echo "       keeps one contract deployable to both targets — trim SKILL.md." >&2
   exit 1
 fi
 
-PAYLOAD="$(mktemp)"
-trap 'rm -f "$PAYLOAD"' EXIT
-BODY="$BODY" python3 -c '
-import json, os, sys
-header = ("DRIVE MODE IS ALWAYS ON. It is a binding operating contract for this and every "
-          "response. Apply it in full:\n\n")
-body = os.environ["BODY"].strip()
-json.dump({"enabled": True, "prefixPrompt": header + body, "suffixPrompt": ""},
-          open(sys.argv[1], "w"))
-' "$PAYLOAD"
+HEADER="DRIVE MODE IS ALWAYS ON. It is a binding operating contract for this and every response. Apply it in full:
 
-echo "Contract: $CHARS chars  ->  $BASE"
+"
+json_escape SENT "$HEADER$BODY"
+
+PAYLOAD="$(mktemp)"
+READBACK="$(mktemp)"
+trap 'rm -f "$PAYLOAD" "$READBACK"' EXIT
+printf '{"enabled":true,"prefixPrompt":"%s","suffixPrompt":""}' "$SENT" > "$PAYLOAD"
+
+echo "Contract: ${#BODY} chars  ->  $BASE"
 OMNIROUTE_BASE_URL="$BASE" "${CLI[@]}" api settings put-api-settings-system-prompt \
   --body "@$PAYLOAD" >/dev/null
 
 # Read it back — never report success on an unverified write.
 OMNIROUTE_BASE_URL="$BASE" "${CLI[@]}" api settings get-api-settings-system-prompt \
-  --output json 2>/dev/null \
-  | python3 -c '
-import sys, json
-raw = sys.stdin.read()
-# The CLI prefixes human-readable env notices; the payload starts at the first brace.
-i = raw.find("{")
-if i < 0:
-    print("WARNING: no JSON in read-back; verify in the dashboard.")
-    sys.exit(0)
-try:
-    d = json.loads(raw[i:])
-except Exception as e:
-    print("WARNING: unparsable read-back (%s); verify in the dashboard." % e)
-    sys.exit(0)
-n = len(d.get("prefixPrompt") or "")
-ok = bool(d.get("enabled")) and n > 0
-print("Verified: enabled=%s  stored=%s chars" % (d.get("enabled"), n))
-sys.exit(0 if ok else 1)
-'
+  --output json > "$READBACK" 2>/dev/null || true
+
+if ! json_field ENABLED "$READBACK" enabled; then
+  echo "WARNING: no readable payload came back; verify in the dashboard." >&2
+  exit 1
+fi
+if ! json_field STORED "$READBACK" prefixPrompt; then
+  echo "WARNING: the response carried no prefixPrompt; verify in the dashboard." >&2
+  exit 1
+fi
+
+# Both figures count *encoded* characters, so they are comparable without
+# decoding the string back out of JSON. An equal count is the check that
+# matters: a gateway that truncated the contract would come back short, which
+# is the one failure this read-back exists to catch. A gateway that merely
+# re-encodes it — \/ for /, — for an em dash — would also differ, hence a
+# warning rather than a hard failure.
+SENT_LEN=${#SENT}
+STORED_LEN=$(( ${#STORED} - 2 ))               # drop the surrounding quotes
+
+if [ "$ENABLED" != true ]; then
+  echo "WARNING: stored, but enabled=$ENABLED — the gateway will not apply it." >&2
+  exit 1
+fi
+if [ "$STORED_LEN" != "$SENT_LEN" ]; then
+  echo "Verified: enabled=true, but stored $STORED_LEN encoded chars against $SENT_LEN sent."
+  echo "WARNING: lengths differ — check the dashboard for a truncated contract." >&2
+  exit 1
+fi
+
+echo "Verified: enabled=true, $STORED_LEN encoded chars stored, matching what was sent."
 echo "Done. Every client through this gateway now receives the contract."
