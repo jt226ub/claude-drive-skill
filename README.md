@@ -119,13 +119,41 @@ Honest limits, all covered by the test suite:
   there, but the hook and the two slash commands still read the flag and the
   skill from `$HOME/.claude`. `install.sh` says so when you do it.
 
+## Checking a machine
+
+Rolling this out to a second machine raises an obvious question — is drive mode
+actually running there, and on which contract? Both answers are one line, and
+both should be asked of *behaviour*, not of the source text:
+
+```bash
+# Is the standing mode actually injecting anything?
+bash ~/.claude/hooks/drive-mode.sh | head -1
+
+# Which contract is installed?
+grep -q 'Harness-agnostic' ~/.claude/skills/drive/SKILL.md && echo current || echo pre-1.5
+```
+
+A working install prints `DRIVE MODE IS ON …`. Silence means one of two things:
+the flag is simply off (check that `~/.claude/drive-mode` exists — `/drive-on`
+creates it), or the hook is broken. **The broken case is silent by design**, and
+it is the one that motivated all of this: the old hook piped through `jq`,
+and where `jq` was missing the pipeline failed while the script still exited 0
+— so drive mode injected nothing and said nothing about it. Measured on an old
+install with `jq` off `PATH`: 0 bytes emitted, exit code 0. The current hook
+emits the full contract with `PATH` empty entirely.
+
+Do **not** try to tell the versions apart by grepping the hook for `jq`. The
+current hook names `jq` in a comment explaining why it no longer uses it, so
+`grep -c jq` returns 1 for both the old and the new script. Run the hook
+instead.
+
 ## Tests
 
 ```bash
 ./tests/run-tests.sh
 ```
 
-104 assertions. A JSON editor written by hand is only defensible against
+107 assertions. A JSON editor written by hand is only defensible against
 evidence, so the suite covers the shapes a real `settings.json` takes — no
 `hooks` key, `hooks` without `UserPromptSubmit`, an existing foreign entry,
 minified, tab-indented, unicode and quoted prose — and asserts valid JSON out,
@@ -133,9 +161,11 @@ unrelated settings preserved, a full install/uninstall round trip that restores
 the file byte for byte, and a refusal that leaves a malformed file untouched
 rather than guessing.
 
-It also asserts the two copies of the frontmatter rule stay byte-identical, and
-that no shipped script invokes any of the tools listed above. Verified on bash
-3.2.57, the version macOS ships as `/bin/bash`; newer bash is untested here.
+It also asserts the two copies of the frontmatter rule stay byte-identical, that
+no shipped script invokes any of the tools listed above, and that the hook still
+emits the whole contract with `PATH` set to nothing at all — a direct regression
+guard on the silent failure described above. Verified on bash 3.2.57, the
+version macOS ships as `/bin/bash`; newer bash is untested here.
 
 `python3` is used for independent JSON validation when present. It is a
 developer convenience only — nothing in the installed product needs it — and

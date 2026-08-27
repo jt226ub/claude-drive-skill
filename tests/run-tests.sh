@@ -129,6 +129,33 @@ body
 still body" "$(strip_frontmatter "$WORK/fm-inner-delim.md")" "a --- inside the body survives"
 
 # ---------------------------------------------------------------------------
+group "The hook survives an empty PATH"
+# ---------------------------------------------------------------------------
+# This is the bug the whole project exists to fix. The original hook piped
+# through jq; where jq was missing the pipeline failed, the script still exited
+# 0, and drive mode injected nothing while reporting nothing. So the guard is
+# not "does the source mention jq" — the current hook names jq in a comment and
+# a grep cannot tell the two apart — it is whether the hook still emits the
+# contract with no external command available at all.
+BARE="$FAKEHOME/.claude/skills/drive/SKILL.md"
+mkdir -p "$FAKEHOME/.claude/skills/drive"
+cp "$ROOT/skills/drive/SKILL.md" "$BARE"
+touch "$FAKEHOME/.claude/drive-mode"
+bare_out="$(HOME="$FAKEHOME" PATH="" /bin/bash "$ROOT/hooks/drive-mode.sh" 2>/dev/null)"
+if [ "${#bare_out}" -gt 1000 ]; then
+  ok "the hook injects the contract with PATH empty (${#bare_out} bytes)"
+else
+  bad "the hook injects the contract with PATH empty" "emitted ${#bare_out} bytes"
+fi
+case $bare_out in
+  "DRIVE MODE IS ON"*) ok "its first line is the standing-mode header" ;;
+  *) bad "its first line is the standing-mode header" "got: ${bare_out:0:60}" ;;
+esac
+rm -f "$FAKEHOME/.claude/drive-mode"
+bare_off="$(HOME="$FAKEHOME" PATH="" /bin/bash "$ROOT/hooks/drive-mode.sh" 2>/dev/null)"
+assert_eq "" "$bare_off" "with the flag removed it emits nothing"
+
+# ---------------------------------------------------------------------------
 group "json_escape"
 # ---------------------------------------------------------------------------
 json_escape E 'plain/path.sh'          ; assert_eq 'plain/path.sh' "$E" "leaves a plain path alone"
